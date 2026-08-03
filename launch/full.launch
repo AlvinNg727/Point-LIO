@@ -1,0 +1,5 @@
+<launch>
+    <!-- Launch file for Livox MID360 LiDAR driver + Point-LIO mapping -->
+    <include file="$(find livox_ros_driver2)/launch_ROS1/msg_MID360s.launch" />
+    <include file="$(find point_lio)/launch/mapping_mid360s.launch" />
+</launch>
