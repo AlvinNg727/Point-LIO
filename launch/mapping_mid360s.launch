@@ -3,6 +3,7 @@
 
 	<arg name="rviz" default="true" />
 
+	<!-- to profile, add launch-prefix="valgrind" to the node tag below -->
 	<node pkg="point_lio" type="pointlio_mapping"
         name="laserMapping" output="screen">
         <rosparam command="load" file="$(find point_lio)/config/mid360s.yaml" />
@@ -27,4 +28,4 @@
         <node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz"
             args="-d $(find point_lio)/rviz_cfg/loam_livox.rviz" />
     </group>
-    launch-prefix="valgrind" </launch>
+</launch>

@@ -44,6 +44,17 @@ mapping:
 odometry:
   # publish_odometry_without_downsample: false
   publish_odometry_without_downsample: true
+  # Caps the rate of /aft_mapped_to_init and the camera_init->body TF together.
+  # <= 0 disables the cap (original ~1500 Hz behaviour).
+  #
+  # This drops publishes, it never resamples, so the achieved rate is always a
+  # little UNDER the request: the gate can only fire on a stamp the estimator
+  # actually produced (one every ~0.67 ms at 1500 Hz), never at the exact
+  # interval boundary, so each gap overshoots to the next available stamp.
+  # Expect between 1/(1/f + 0.00067) and f Hz -- at 150 that is ~137-150 Hz,
+  # typically ~143. The shortfall scales with odom_pub_freq / 1500, so it is
+  # negligible at low rates (10 Hz requested gives 9.93 Hz).
+  odom_pub_freq: 150.0 # Hz
 
 publish:
   path_en: true # false: close the path output
