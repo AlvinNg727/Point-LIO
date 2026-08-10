@@ -67,6 +67,9 @@ extern bool is_first_frame;
 
 extern std::vector<double> extrinT;
 extern std::vector<double> extrinR;
+extern std::vector<double> extrinT_base; // t_body_base
+extern std::vector<double> extrinR_base; // R_body_base
+extern std::string odom_frame, base_frame, imu_frame;
 extern double time_diff_lidar_to_imu;
 extern double lidar_time_inte, first_imu_time;
 extern int cut_frame_num, orig_odom_freq;

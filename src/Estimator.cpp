@@ -21,6 +21,9 @@ V3D angvel_avr, acc_avr, acc_avr_norm;
 int feats_down_size = 0;  
 V3D Lidar_T_wrt_IMU(Zero3d);
 M3D Lidar_R_wrt_IMU(Eye3d);
+// base_link expressed in the IMU/body frame. Publish-time only: never enters the filter.
+V3D Base_T_wrt_IMU(Zero3d);
+M3D Base_R_wrt_IMU(Eye3d);
 double G_m_s2 = 9.81;
 
 Eigen::Matrix<double, 24, 24> process_noise_cov_input()

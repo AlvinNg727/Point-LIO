@@ -8,8 +8,10 @@
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl_conversions/pcl_conversions.h>
+#include <geometry_msgs/TransformStamped.h>
 #include <tf/transform_broadcaster.h>
 #include <tf/transform_datatypes.h>
+#include <tf2_ros/static_transform_broadcaster.h>
 #include <visualization_msgs/Marker.h>
 // #include <cv_bridge/cv_bridge.h>
 // #include "matplotlibcpp.h"
@@ -143,7 +145,7 @@ void publish_init_map(const ros::Publisher &pubLaserCloudFullRes) {
     pcl::toROSMsg(*init_feats_world, laserCloudmsg);
 
     laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
-    laserCloudmsg.header.frame_id = "camera_init";
+    laserCloudmsg.header.frame_id = odom_frame;
     pubLaserCloudFullRes.publish(laserCloudmsg);
 }
 
@@ -167,7 +169,7 @@ void publish_frame_world(const ros::Publisher &pubLaserCloudFullRes) {
         pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
 
         laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
-        laserCloudmsg.header.frame_id = "camera_init";
+        laserCloudmsg.header.frame_id = odom_frame;
         pubLaserCloudFullRes.publish(laserCloudmsg);
         // publish_count -= PUBFRAME_PERIOD;
     }
@@ -213,36 +215,43 @@ void publish_frame_body(const ros::Publisher &pubLaserCloudFull_body) {
     sensor_msgs::PointCloud2 laserCloudmsg;
     pcl::toROSMsg(*laserCloudIMUBody, laserCloudmsg);
     laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
-    laserCloudmsg.header.frame_id = "body";
+    laserCloudmsg.header.frame_id = imu_frame;
     pubLaserCloudFull_body.publish(laserCloudmsg);
     // publish_count -= PUBFRAME_PERIOD;
 }
 
+// Orientation of the estimated IMU/body frame in the odom frame.
+inline Eigen::Quaterniond body_quat() {
+    return (!use_imu_as_input) ? Eigen::Quaterniond(kf_output.x_.rot) : Eigen::Quaterniond(kf_input.x_.rot);
+}
+
+// Position of the estimated IMU/body frame in the odom frame.
+inline V3D body_pos() { return (!use_imu_as_input) ? V3D(kf_output.x_.pos) : V3D(kf_input.x_.pos); }
+
+// Pose of base_link in the odom frame. The filter estimates the IMU/body frame, so the
+// fixed body->base_link extrinsic is applied here:
+//   q_base = q_body * R_body_base
+//   p_base = p_body + q_body * t_body_base
+// With the defaults (identity/zero) this reduces to the original body pose.
 template <typename T> void set_posestamp(T &out) {
-    if (!use_imu_as_input) {
-        out.position.x = kf_output.x_.pos(0);
-        out.position.y = kf_output.x_.pos(1);
-        out.position.z = kf_output.x_.pos(2);
-        Eigen::Quaterniond q(kf_output.x_.rot);
-        out.orientation.x = q.coeffs()[0];
-        out.orientation.y = q.coeffs()[1];
-        out.orientation.z = q.coeffs()[2];
-        out.orientation.w = q.coeffs()[3];
-    } else {
-        out.position.x = kf_input.x_.pos(0);
-        out.position.y = kf_input.x_.pos(1);
-        out.position.z = kf_input.x_.pos(2);
-        Eigen::Quaterniond q(kf_input.x_.rot);
-        out.orientation.x = q.coeffs()[0];
-        out.orientation.y = q.coeffs()[1];
-        out.orientation.z = q.coeffs()[2];
-        out.orientation.w = q.coeffs()[3];
-    }
+    const Eigen::Quaterniond q_body = body_quat();
+
+    const V3D p_base = body_pos() + q_body * Base_T_wrt_IMU;
+    Eigen::Quaterniond q_base = q_body * Eigen::Quaterniond(Base_R_wrt_IMU);
+    q_base.normalize();
+
+    out.position.x = p_base(0);
+    out.position.y = p_base(1);
+    out.position.z = p_base(2);
+    out.orientation.x = q_base.x();
+    out.orientation.y = q_base.y();
+    out.orientation.z = q_base.z();
+    out.orientation.w = q_base.w();
 }
 
 void publish_odometry(const ros::Publisher &pubOdomAftMapped) {
-    odomAftMapped.header.frame_id = "camera_init";
-    odomAftMapped.child_frame_id = "body";
+    odomAftMapped.header.frame_id = odom_frame;
+    odomAftMapped.child_frame_id = base_frame;
     const double stamp = publish_odometry_without_downsample ? time_current : lidar_end_time;
 
     if (odom_pub_freq > 0.0) {
@@ -258,6 +267,25 @@ void publish_odometry(const ros::Publisher &pubOdomAftMapped) {
     odomAftMapped.header.stamp = ros::Time().fromSec(stamp);
     set_posestamp(odomAftMapped.pose.pose);
 
+    // nav_msgs/Odometry twist is expressed in child_frame_id, i.e. base_link.
+    // In the state, vel is world-frame and omg is body-frame. state_input carries no omg,
+    // so that path falls back to the latest bias-corrected gyro sample.
+    const Eigen::Quaterniond q_body = body_quat();
+    const V3D vel_world = (!use_imu_as_input) ? V3D(kf_output.x_.vel) : V3D(kf_input.x_.vel);
+    const V3D omg_body = (!use_imu_as_input) ? V3D(kf_output.x_.omg) : V3D(angvel_avr - kf_input.x_.bg);
+
+    const V3D vel_body = q_body.conjugate() * vel_world;
+    const V3D w_base = Base_R_wrt_IMU.transpose() * omg_body;
+    // Lever-arm term: a base_link offset from the IMU picks up velocity under rotation.
+    const V3D v_base = Base_R_wrt_IMU.transpose() * (vel_body + omg_body.cross(Base_T_wrt_IMU));
+
+    odomAftMapped.twist.twist.linear.x = v_base(0);
+    odomAftMapped.twist.twist.linear.y = v_base(1);
+    odomAftMapped.twist.twist.linear.z = v_base(2);
+    odomAftMapped.twist.twist.angular.x = w_base(0);
+    odomAftMapped.twist.twist.angular.y = w_base(1);
+    odomAftMapped.twist.twist.angular.z = w_base(2);
+
     pubOdomAftMapped.publish(odomAftMapped);
 
     static tf::TransformBroadcaster br;
@@ -270,14 +298,43 @@ void publish_odometry(const ros::Publisher &pubOdomAftMapped) {
     q.setY(odomAftMapped.pose.pose.orientation.y);
     q.setZ(odomAftMapped.pose.pose.orientation.z);
     transform.setRotation(q);
-    br.sendTransform(tf::StampedTransform(transform, odomAftMapped.header.stamp, "camera_init", "body"));
+    br.sendTransform(tf::StampedTransform(transform, odomAftMapped.header.stamp, odom_frame, base_frame));
+}
+
+// Declares base_link -> IMU/body on /tf_static, so the flip is described once and both the
+// odometry math and the TF tree read it from the same yaml keys. Called once at startup.
+void publish_static_tf() {
+    // Defaults leave base_frame == imu_frame; emitting that would be a self-loop.
+    if (base_frame == imu_frame) {
+        return;
+    }
+    static tf2_ros::StaticTransformBroadcaster static_br;
+
+    // The config stores body->base_link; TF needs base_link->body, so invert it.
+    const M3D R_base_imu = Base_R_wrt_IMU.transpose();
+    const V3D t_base_imu = -R_base_imu * Base_T_wrt_IMU;
+    Eigen::Quaterniond q(R_base_imu);
+    q.normalize();
+
+    geometry_msgs::TransformStamped tf_msg;
+    tf_msg.header.stamp = ros::Time::now();
+    tf_msg.header.frame_id = base_frame;
+    tf_msg.child_frame_id = imu_frame;
+    tf_msg.transform.translation.x = t_base_imu(0);
+    tf_msg.transform.translation.y = t_base_imu(1);
+    tf_msg.transform.translation.z = t_base_imu(2);
+    tf_msg.transform.rotation.x = q.x();
+    tf_msg.transform.rotation.y = q.y();
+    tf_msg.transform.rotation.z = q.z();
+    tf_msg.transform.rotation.w = q.w();
+    static_br.sendTransform(tf_msg);
 }
 
 void publish_path(const ros::Publisher pubPath) {
     set_posestamp(msg_body_pose.pose);
     // msg_body_pose.header.stamp = ros::Time::now();
     msg_body_pose.header.stamp = ros::Time().fromSec(lidar_end_time);
-    msg_body_pose.header.frame_id = "camera_init";
+    msg_body_pose.header.frame_id = odom_frame;
     static int jjj = 0;
     jjj++;
     // if (jjj % 2 == 0) // if path is too large, the rvis will crash
@@ -297,7 +354,7 @@ int main(int argc, char **argv) {
     ivox_ = std::make_shared<IVoxType>(ivox_options_);
 
     path.header.stamp = ros::Time().fromSec(lidar_end_time);
-    path.header.frame_id = "camera_init";
+    path.header.frame_id = odom_frame;
 
     /*** variables definition for counting ***/
     int frame_num = 0;
@@ -310,6 +367,9 @@ int main(int argc, char **argv) {
 
     Lidar_T_wrt_IMU << VEC_FROM_ARRAY(extrinT);
     Lidar_R_wrt_IMU << MAT_FROM_ARRAY(extrinR);
+    Base_T_wrt_IMU << VEC_FROM_ARRAY(extrinT_base);
+    Base_R_wrt_IMU << MAT_FROM_ARRAY(extrinR_base);
+    publish_static_tf();
 
     if (extrinsic_est_en) {
         if (!use_imu_as_input) {

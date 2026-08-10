@@ -52,6 +52,7 @@ find_package(catkin REQUIRED COMPONENTS
   std_msgs
   pcl_ros
   tf
+  tf2_ros
   livox_ros_driver2
   message_generation
   eigen_conversions
@@ -80,7 +81,7 @@ generate_messages(
 )
 
 catkin_package(
-  CATKIN_DEPENDS geometry_msgs nav_msgs roscpp rospy std_msgs message_runtime
+  CATKIN_DEPENDS geometry_msgs nav_msgs roscpp rospy std_msgs tf2_ros message_runtime
   DEPENDS EIGEN3 PCL
   INCLUDE_DIRS
 )

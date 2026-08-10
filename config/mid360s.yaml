@@ -11,7 +11,7 @@ preprocess:
   lidar_type: 1 # 4
   scan_line: 4 # 32
   timestamp_unit: 1 # the unit of time/t field in the PointCloud2 rostopic: 0-second, 1-milisecond, 2-microsecond, 3-nanosecond.
-  blind: 0.5
+  blind: 0.3
 
 mapping:
   imu_en: true
@@ -40,11 +40,19 @@ mapping:
   # extrinsic_T: [0.04165, 0.02326, -0.0284] # avia # [0.011, 0.02329, -0.04412] # mid360
   extrinsic_T: [-0.011, -0.02329, 0.04412]
   extrinsic_R: [1, 0, 0, 0, 1, 0, 0, 0, 1]
+  # base_link pose expressed in the IMU/body frame: R_body_base, t_body_base.
+  # The MID360 is mounted flipped 180 deg in roll, with base_link coincident with the
+  # IMU origin -- so this is a pure Rx(180) and the translation stays zero. Applied at
+  # publish time only (odometry pose/twist and the base_link->body static TF); it never
+  # enters the filter. Defaults are identity/zero, so other configs are unaffected.
+  extrinsic_T_base: [0.0, 0.0, 0.0]
+  # extrinsic_R_base: [1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, -1.0] # upside down MID360s
+  extrinsic_R_base: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
 
 odometry:
   # publish_odometry_without_downsample: false
   publish_odometry_without_downsample: true
-  # Caps the rate of /aft_mapped_to_init and the camera_init->body TF together.
+  # Caps the rate of /aft_mapped_to_init and the odom_frame->base_frame TF together.
   # <= 0 disables the cap (original ~1500 Hz behaviour).
   #
   # This drops publishes, it never resamples, so the achieved rate is always a
@@ -57,6 +65,12 @@ odometry:
   odom_pub_freq: 150.0 # Hz
 
 publish:
+  # TF tree: odom_frame -> base_frame (dynamic, at odom_pub_freq)
+  #                     -> imu_frame  (static, latched on /tf_static)
+  # imu_frame is what the filter actually estimates; base_frame is what odometry reports.
+  odom_frame: "camera_init"
+  base_frame: "base_link"
+  imu_frame: "body"
   path_en: true # false: close the path output
   scan_publish_en: true # false: close all the point cloud output
   scan_bodyframe_pub_en: false # true: output the point cloud scans in IMU-body-frame

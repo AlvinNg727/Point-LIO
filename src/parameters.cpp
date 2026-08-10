@@ -9,6 +9,9 @@ int ivox_nearby_type = 6;
 
 std::vector<double> extrinT(3, 0.0);
 std::vector<double> extrinR(9, 0.0);
+std::vector<double> extrinT_base(3, 0.0);
+std::vector<double> extrinR_base{1, 0, 0, 0, 1, 0, 0, 0, 1};
+std::string odom_frame, base_frame, imu_frame;
 state_input state_in;
 state_output state_out;
 std::string lid_topic, imu_topic;
@@ -44,6 +47,18 @@ bool cut_frame_init = false;      // true;
 MeasureGroup Measures;
 
 ofstream fout_out, fout_imu_pbp;
+
+namespace {
+// VEC_FROM_ARRAY / MAT_FROM_ARRAY index raw, so a wrong-sized vector is an out-of-bounds
+// read rather than a clean failure. Fall back to the default instead.
+void validate_extrinsic(std::vector<double> &v, size_t expected, const char *name,
+                        const std::vector<double> &fallback) {
+    if (v.size() != expected) {
+        ROS_WARN("Point-LIO: %s needs %zu elements, got %zu -- using default.", name, expected, v.size());
+        v = fallback;
+    }
+}
+} // namespace
 
 void readParameters(ros::NodeHandle &nh) {
     p_pre.reset(new Preprocess());
@@ -93,6 +108,16 @@ void readParameters(ros::NodeHandle &nh) {
     nh.param<std::vector<double>>("mapping/gravity_init", gravity_init, std::vector<double>());
     nh.param<std::vector<double>>("mapping/extrinsic_T", extrinT, std::vector<double>());
     nh.param<std::vector<double>>("mapping/extrinsic_R", extrinR, std::vector<double>());
+    // base_link pose expressed in the IMU/body frame: R_body_base, t_body_base.
+    // Defaults to identity so an unmodified config behaves exactly as before.
+    nh.param<std::vector<double>>("mapping/extrinsic_T_base", extrinT_base, std::vector<double>{0, 0, 0});
+    nh.param<std::vector<double>>("mapping/extrinsic_R_base", extrinR_base,
+                                  std::vector<double>{1, 0, 0, 0, 1, 0, 0, 0, 1});
+    validate_extrinsic(extrinT_base, 3, "mapping/extrinsic_T_base", {0, 0, 0});
+    validate_extrinsic(extrinR_base, 9, "mapping/extrinsic_R_base", {1, 0, 0, 0, 1, 0, 0, 0, 1});
+    nh.param<std::string>("publish/odom_frame", odom_frame, std::string("camera_init"));
+    nh.param<std::string>("publish/base_frame", base_frame, std::string("body"));
+    nh.param<std::string>("publish/imu_frame", imu_frame, std::string("body"));
     nh.param<bool>("odometry/publish_odometry_without_downsample", publish_odometry_without_downsample, false);
     nh.param<double>("odometry/odom_pub_freq", odom_pub_freq, 0.0);
     nh.param<bool>("publish/path_en", path_en, true);
