@@ -1,11 +1,17 @@
 <launch>
     <!-- Launch file for Livox MID360S LiDAR -->
 
-	<arg name="rviz" default="true" />
+    <arg name="rviz" default="true" />
+    <arg name="log_dir" default="$(find point_lio)/Log" />
 
-	<!-- to profile, add launch-prefix="valgrind" to the node tag below -->
-	<node pkg="point_lio" type="pointlio_mapping"
-        name="laserMapping" output="screen">
+    <!--
+		to profile, add launch-prefix="valgrind" to the node tag below
+		output is line-buffered and teed to $(arg log_dir)/laserMapping.log,
+		so crash output is not lost
+	-->
+    <node pkg="point_lio" type="pointlio_mapping"
+        name="laserMapping" output="screen"
+        launch-prefix="$(find point_lio)/scripts/run_with_log.sh $(arg log_dir)/laserMapping.log">
         <rosparam command="load" file="$(find point_lio)/config/mid360s.yaml" />
         <param name="use_imu_as_input" type="bool" value="0" /> <!--change
         to 1 to use IMU as input of Point-LIO-->
@@ -22,8 +28,11 @@
         <param name="ivox_nearby_type" type="int" value="6" /> <!--0.5,
         0.3, 0.15, 0.1-->
         <param name="runtime_pos_log_enable" type="bool" value="0" /> <!--1-->
+        <!-- publish the LIO pose where downstream nodes expect the ZED pose -->
+        <remap from="/lio_pose" to="/zed2i/zed_node/pose" />
+        <remap from="/lio_pose_with_covariance" to="/zed2i/zed_node/pose_with_covariance" />
     </node>
-	<group
+    <group
         if="$(arg rviz)">
         <node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz"
             args="-d $(find point_lio)/rviz_cfg/loam_livox.rviz" />

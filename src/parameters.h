@@ -44,7 +44,8 @@ extern std::string lid_topic, imu_topic;
 extern bool prop_at_freq_of_imu, check_satu, con_frame, cut_frame;
 extern bool use_imu_as_input, space_down_sample;
 extern bool extrinsic_est_en, publish_odometry_without_downsample;
-extern double odom_pub_freq; // Hz; <= 0 means unlimited
+extern bool odom_pub_freq_en; // false => publish every estimator update
+extern double odom_pub_freq;  // Hz; only consulted when odom_pub_freq_en
 extern int init_map_size, con_frame_num;
 extern double match_s, satu_acc, satu_gyro, cut_frame_time_interval;
 extern float plane_thr;
@@ -69,7 +70,12 @@ extern std::vector<double> extrinT;
 extern std::vector<double> extrinR;
 extern std::vector<double> extrinT_base; // t_body_base
 extern std::vector<double> extrinR_base; // R_body_base
-extern std::string odom_frame, base_frame, imu_frame;
+extern std::string map_frame, odom_frame, base_frame, imu_frame;
+extern double pose_cov_scale;             // multiplies the whole published 6x6
+extern std::vector<double> pose_cov_min;  // diagonal floor, [m^2 x3, rad^2 x3]
+extern double odom_stall_warn_sec;        // wall seconds of odometry silence before the
+                                          // watchdog logs; <= 0 disables it
+extern int path_max_poses;                // cap on nav_msgs/Path length; <= 0 means unbounded
 extern double time_diff_lidar_to_imu;
 extern double lidar_time_inte, first_imu_time;
 extern int cut_frame_num, orig_odom_freq;

@@ -17,6 +17,13 @@ condition_variable sig_buffer;
 int scan_count = 0;
 int frame_ct = 0, wait_num = 0;
 std::mutex m_time;
+// Wall-clock instant each subscriber last had a message handed to it, and how many of those
+// messages it threw away on the monotonicity guard below. The stall watchdog reads all four:
+// together they separate "the driver stopped" (ages climb, drops flat) from "data is arriving
+// but this node is refusing it" (ages flat, drops climb) from "data is arriving and being
+// accepted, so the stall is downstream of the callbacks" (ages flat, drops flat).
+double last_lidar_cbk_walltime = -1.0, last_imu_cbk_walltime = -1.0;
+uint64_t lidar_loopback_drops = 0, imu_loopback_drops = 0;
 bool lidar_pushed = false, imu_pushed = false;
 std::deque<PointCloudXYZI::Ptr> lidar_buffer;
 std::deque<double> time_buffer;
@@ -25,9 +32,17 @@ std::deque<sensor_msgs::Imu::Ptr> imu_deque;
 void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg) {
     // mtx_buffer.lock();
     scan_count++;
+    last_lidar_cbk_walltime = ros::WallTime::now().toSec();
     double preprocess_start_time = omp_get_wtime();
     if (msg->header.stamp.toSec() < last_timestamp_lidar) {
-        ROS_ERROR("lidar loop back, clear buffer");
+        // A single message stamped in the future latches last_timestamp_lidar there and
+        // every later scan is dropped here for good -- the driver keeps publishing, this
+        // node never sees another point, and the pose stream stops. Throttled and counted
+        // so that shows up as a climbing drop count in the watchdog instead of log spam.
+        ++lidar_loopback_drops;
+        ROS_ERROR_THROTTLE(2.0, "Point-LIO: lidar loop back -- dropping scan (t=%.6f <= latched %.6f, %lu dropped)",
+                           msg->header.stamp.toSec(), last_timestamp_lidar,
+                           static_cast<unsigned long>(lidar_loopback_drops));
         // lidar_buffer.shrink_to_fit();
 
         // mtx_buffer.unlock();
@@ -92,8 +107,13 @@ void livox_pcl_cbk(const livox_ros_driver2::CustomMsg::ConstPtr &msg) {
     // mtx_buffer.lock();
     double preprocess_start_time = omp_get_wtime();
     scan_count++;
+    last_lidar_cbk_walltime = ros::WallTime::now().toSec();
     if (msg->header.stamp.toSec() < last_timestamp_lidar) {
-        ROS_ERROR("lidar loop back, clear buffer");
+        // See standard_pcl_cbk: one future-stamped scan wedges this guard permanently.
+        ++lidar_loopback_drops;
+        ROS_ERROR_THROTTLE(2.0, "Point-LIO: lidar loop back -- dropping scan (t=%.6f <= latched %.6f, %lu dropped)",
+                           msg->header.stamp.toSec(), last_timestamp_lidar,
+                           static_cast<unsigned long>(lidar_loopback_drops));
 
         // mtx_buffer.unlock();
         // sig_buffer.notify_all();
@@ -164,10 +184,16 @@ void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in) {
         ros::Time().fromSec(msg->header.stamp.toSec() - timediff_imu_wrt_lidar - time_lag_IMU_wtr_lidar);
 
     double timestamp = msg->header.stamp.toSec();
+    last_imu_cbk_walltime = ros::WallTime::now().toSec();
     // printf("time_diff%f, %f, %f\n", last_timestamp_imu - timestamp, last_timestamp_imu, timestamp);
 
     if (timestamp < last_timestamp_imu) {
-        ROS_ERROR("imu loop back, clear deque");
+        // Same latching hazard as the lidar guard, and worse here: sync_packages will not
+        // release a scan until last_timestamp_imu reaches its end time, so once this starts
+        // dropping every sample the whole pipeline stops with nothing else logged.
+        ++imu_loopback_drops;
+        ROS_ERROR_THROTTLE(2.0, "Point-LIO: imu loop back -- dropping sample (t=%.6f <= latched %.6f, %lu dropped)",
+                           timestamp, last_timestamp_imu, static_cast<unsigned long>(imu_loopback_drops));
         // imu_deque.shrink_to_fit();
         // cout << "check time:" << timestamp << ";" << last_timestamp_imu << endl;
         // printf("time_diff%f, %f, %f\n", last_timestamp_imu - timestamp, last_timestamp_imu, timestamp);

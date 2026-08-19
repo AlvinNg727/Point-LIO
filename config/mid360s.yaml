@@ -28,8 +28,8 @@ mapping:
   gyr_cov_output: 1000
   b_acc_cov: 0.0001
   b_gyr_cov: 0.0001
-  imu_meas_acc_cov: 0.1 #0.1 # 0.1
-  imu_meas_omg_cov: 0.1 #0.01 # 0.1
+  imu_meas_acc_cov: 0.1 # 0.1 # 0.1
+  imu_meas_omg_cov: 0.1 # 0.01 # 0.1
   gyr_cov_input: 0.01 # for IMU as input model
   acc_cov_input: 0.1 # for IMU as input model
   plane_thr: 0.1 # 0.05, the threshold for plane criteria, the smaller, the flatter a plane
@@ -45,15 +45,18 @@ mapping:
   # IMU origin -- so this is a pure Rx(180) and the translation stays zero. Applied at
   # publish time only (odometry pose/twist and the base_link->body static TF); it never
   # enters the filter. Defaults are identity/zero, so other configs are unaffected.
-  extrinsic_T_base: [0.0, 0.0, 0.0]
+  extrinsic_T_base: [-0.011, 0.22441, -0.0886] # lidar imu (as the output pose is in the imu frame)
+  # extrinsic_R_base: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0] # normal
   # extrinsic_R_base: [1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, -1.0] # upside down MID360s
-  extrinsic_R_base: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+  extrinsic_R_base: [0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, -1.0]
 
 odometry:
   # publish_odometry_without_downsample: false
   publish_odometry_without_downsample: true
-  # Caps the rate of /aft_mapped_to_init and the odom_frame->base_frame TF together.
-  # <= 0 disables the cap (original ~1500 Hz behaviour).
+  # Caps the rate of /aft_mapped_to_init, /lio_pose, /lio_pose_with_covariance and the
+  # odom_frame->base_frame TF together. odom_pub_freq_en is the on/off switch (false =>
+  # original ~1500 Hz behaviour); odom_pub_freq only says how fast, so the tuned rate can
+  # stay here while the cap is off.
   #
   # This drops publishes, it never resamples, so the achieved rate is always a
   # little UNDER the request: the gate can only fire on a stamp the estimator
@@ -62,15 +65,55 @@ odometry:
   # Expect between 1/(1/f + 0.00067) and f Hz -- at 150 that is ~137-150 Hz,
   # typically ~143. The shortfall scales with odom_pub_freq / 1500, so it is
   # negligible at low rates (10 Hz requested gives 9.93 Hz).
-  odom_pub_freq: 150.0 # Hz
+  odom_pub_freq_en: true
+  odom_pub_freq: 200.0 # Hz
 
 publish:
-  # TF tree: odom_frame -> base_frame (dynamic, at odom_pub_freq)
-  #                     -> imu_frame  (static, latched on /tf_static)
+  # TF tree:
+  #   odom_frame -> map_frame   (static, latched once the filter has a pose)
+  #              -> base_frame  (dynamic, at odom_pub_freq)
+  #                             -> imu_frame (static, latched on /tf_static)
+  #
   # imu_frame is what the filter actually estimates; base_frame is what odometry reports.
-  odom_frame: "camera_init"
-  base_frame: "base_link"
+  #
+  # map_frame is the filter's own world frame -- the registered clouds live here. It is
+  # gravity-levelled, but nothing constrains its yaw, and with this inverted mount that yaw
+  # is not repeatable run to run (see the note in laserMapping.cpp's set_posestamp).
+  #
+  # odom_frame is base_link's pose at initialisation: origin at the start point, axes along
+  # base_link, per REP-105. Naming it apart from map_frame is what enables the re-basing --
+  # leave the two identical and odometry is published in map_frame, as it was before. Keep
+  # them distinct here, otherwise base_link's axes come out rotated by an arbitrary angle
+  # and lateral (base y) motion reads out along some other axis.
+  #
+  # base_frame is deliberately NOT "base_link": the ZED wrapper broadcasts odom->base_link
+  # for the same physical frame, and a frame may only have one parent, so sharing the name
+  # makes the combined TF tree malformed the moment both estimators run. The name is a
+  # label only -- it sets /aft_mapped_to_init's child_frame_id and the TF child, nothing
+  # more. The pose still lands on the drone's base_link via extrinsic_{T,R}_base above, so
+  # this odometry stays directly comparable to the ZED's.
+  map_frame: "camera_init"
+  odom_frame: "lio_odom"
+  base_frame: "lio_base_link"
   imu_frame: "body"
+  # Covariance for /lio_pose_with_covariance, derived from the filter's own error-state P
+  # (position and rotation blocks) transformed into odom_frame. Point-LIO's P is optimistic in
+  # absolute terms -- it is an odometry filter with no loop closure, so it has no way to know
+  # about the drift it is accumulating -- and these two knobs are how a downstream EKF gets
+  # told not to over-trust it. scale multiplies the whole matrix; min floors the diagonal, in
+  # [m^2, m^2, m^2, rad^2, rad^2, rad^2]. The defaults below publish P untouched.
+  pose_cov_scale: 1.0
+  pose_cov_min: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  # Wall-clock seconds of odometry silence before the node logs a STALL line naming which
+  # stage is stuck (sensor age, dropped-message counts, buffer depths, the sync_packages
+  # wait, and whether the filter has gone non-finite). <= 0 turns the watchdog off. This
+  # node's characteristic failure is to stop publishing while staying alive and quiet, so
+  # leave it on -- it costs one comparison per loop iteration.
+  odom_stall_warn_sec: 1.0
+  # /path is cumulative and is re-sent in full on every scan, so leaving it uncapped grows
+  # both memory and per-publish bandwidth linearly with uptime. 20000 poses is ~33 min at
+  # 10 Hz; the oldest are dropped past that. <= 0 restores the uncapped upstream behaviour.
+  path_max_poses: 20000
   path_en: true # false: close the path output
   scan_publish_en: true # false: close all the point cloud output
   scan_bodyframe_pub_en: false # true: output the point cloud scans in IMU-body-frame

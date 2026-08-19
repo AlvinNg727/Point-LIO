@@ -11,13 +11,18 @@ std::vector<double> extrinT(3, 0.0);
 std::vector<double> extrinR(9, 0.0);
 std::vector<double> extrinT_base(3, 0.0);
 std::vector<double> extrinR_base{1, 0, 0, 0, 1, 0, 0, 0, 1};
-std::string odom_frame, base_frame, imu_frame;
+std::string map_frame, odom_frame, base_frame, imu_frame;
+double pose_cov_scale = 1.0;            // 1 => publish the filter's numbers untouched
+std::vector<double> pose_cov_min(6, 0.0); // 0 => no floor
+double odom_stall_warn_sec = 1.0;       // <= 0 disables the stall watchdog
+int path_max_poses = 20000;             // <= 0 keeps every pose, as upstream did
 state_input state_in;
 state_output state_out;
 std::string lid_topic, imu_topic;
 bool prop_at_freq_of_imu = true, check_satu = true, con_frame = false, cut_frame = false;
 bool use_imu_as_input = false, space_down_sample = true, publish_odometry_without_downsample = false;
-double odom_pub_freq = 0.0; // 0 => unlimited
+bool odom_pub_freq_en = false; // false => publish every estimator update
+double odom_pub_freq = 0.0;    // Hz; only consulted when odom_pub_freq_en
 int init_map_size = 10, con_frame_num = 1;
 double match_s = 81, satu_acc, satu_gyro, cut_frame_time_interval = 0.1;
 float plane_thr = 0.1f;
@@ -50,9 +55,10 @@ ofstream fout_out, fout_imu_pbp;
 
 namespace {
 // VEC_FROM_ARRAY / MAT_FROM_ARRAY index raw, so a wrong-sized vector is an out-of-bounds
-// read rather than a clean failure. Fall back to the default instead.
-void validate_extrinsic(std::vector<double> &v, size_t expected, const char *name,
-                        const std::vector<double> &fallback) {
+// read rather than a clean failure. Fall back to the default instead. Same hazard for any
+// other fixed-length list read from yaml, hence the general name.
+void validate_vector_size(std::vector<double> &v, size_t expected, const char *name,
+                          const std::vector<double> &fallback) {
     if (v.size() != expected) {
         ROS_WARN("Point-LIO: %s needs %zu elements, got %zu -- using default.", name, expected, v.size());
         v = fallback;
@@ -113,13 +119,41 @@ void readParameters(ros::NodeHandle &nh) {
     nh.param<std::vector<double>>("mapping/extrinsic_T_base", extrinT_base, std::vector<double>{0, 0, 0});
     nh.param<std::vector<double>>("mapping/extrinsic_R_base", extrinR_base,
                                   std::vector<double>{1, 0, 0, 0, 1, 0, 0, 0, 1});
-    validate_extrinsic(extrinT_base, 3, "mapping/extrinsic_T_base", {0, 0, 0});
-    validate_extrinsic(extrinR_base, 9, "mapping/extrinsic_R_base", {1, 0, 0, 0, 1, 0, 0, 0, 1});
+    validate_vector_size(extrinT_base, 3, "mapping/extrinsic_T_base", {0, 0, 0});
+    validate_vector_size(extrinR_base, 9, "mapping/extrinsic_R_base", {1, 0, 0, 0, 1, 0, 0, 0, 1});
+    // map_frame is the filter's own world frame -- gravity-levelled, but with whatever yaw
+    // the IMU happened to start at. odom_frame is base_link's pose at initialisation. Both
+    // default to camera_init: naming them identically keeps the legacy single-frame
+    // behaviour, naming them apart opts into the REP-105 base-aligned odom frame.
+    nh.param<std::string>("publish/map_frame", map_frame, std::string("camera_init"));
     nh.param<std::string>("publish/odom_frame", odom_frame, std::string("camera_init"));
     nh.param<std::string>("publish/base_frame", base_frame, std::string("body"));
     nh.param<std::string>("publish/imu_frame", imu_frame, std::string("body"));
+    // Shaping knobs for /lio_pose_with_covariance. The filter's own P is optimistic in
+    // absolute terms, so scale inflates it and min floors the diagonal before publishing.
+    // Defaults (1.0, all zeros) pass the filter's numbers through untouched.
+    nh.param<double>("publish/pose_cov_scale", pose_cov_scale, 1.0);
+    nh.param<std::vector<double>>("publish/pose_cov_min", pose_cov_min, std::vector<double>(6, 0.0));
+    validate_vector_size(pose_cov_min, 6, "publish/pose_cov_min", std::vector<double>(6, 0.0));
+    // How long odometry may go silent before the watchdog in laserMapping.cpp complains.
+    // The node's characteristic failure is stopping while staying alive, so the default is
+    // on: a few scan periods, long enough not to fire on ordinary jitter.
+    nh.param<double>("publish/odom_stall_warn_sec", odom_stall_warn_sec, 1.0);
+    // nav_msgs/Path is cumulative and is re-serialised in full on every scan, so an
+    // uncapped path costs O(runtime) memory and O(runtime) bandwidth per publish -- at
+    // 10 Hz an hour of flying is ~36k poses re-sent 10x a second. Keep the newest N.
+    nh.param<int>("publish/path_max_poses", path_max_poses, 20000);
     nh.param<bool>("odometry/publish_odometry_without_downsample", publish_odometry_without_downsample, false);
+    // The cap is opt-in: odom_pub_freq only says how fast, odom_pub_freq_en says whether.
+    // Keeping them apart means the tuned rate survives switching the cap off.
+    nh.param<bool>("odometry/odom_pub_freq_en", odom_pub_freq_en, false);
     nh.param<double>("odometry/odom_pub_freq", odom_pub_freq, 0.0);
+    if (odom_pub_freq_en && odom_pub_freq <= 0.0) {
+        ROS_WARN("Point-LIO: odometry/odom_pub_freq_en is set but odom_pub_freq is %.3f Hz -- "
+                 "publishing uncapped.",
+                 odom_pub_freq);
+        odom_pub_freq_en = false;
+    }
     nh.param<bool>("publish/path_en", path_en, true);
     nh.param<bool>("publish/scan_publish_en", scan_pub_en, 1);
     nh.param<bool>("publish/scan_bodyframe_pub_en", scan_body_pub_en, 1);

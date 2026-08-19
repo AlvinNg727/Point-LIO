@@ -8,6 +8,7 @@
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl_conversions/pcl_conversions.h>
+#include <geometry_msgs/PoseWithCovarianceStamped.h>
 #include <geometry_msgs/TransformStamped.h>
 #include <tf/transform_broadcaster.h>
 #include <tf/transform_datatypes.h>
@@ -47,6 +48,18 @@ V3D euler_cur;
 nav_msgs::Path path;
 nav_msgs::Odometry odomAftMapped;
 geometry_msgs::PoseStamped msg_body_pose;
+geometry_msgs::PoseStamped lio_pose;
+geometry_msgs::PoseWithCovarianceStamped lio_pose_cov;
+
+// The estimator stamp of the most recent odometry publish, and the wall-clock instant it
+// went out at. The first is how publish_odometry suppresses a repeat of an instant it has
+// already sent (distinct from the rate gate's own static, which tracks the last stamp the
+// gate *let through* rather than the last one actually published). The second is what the
+// stall watchdog in the main loop measures against, and it has to be wall time: a stalled
+// node stops producing sensor stamps altogether, so sensor time cannot detect its own
+// absence.
+double last_published_odom_stamp_ = -1.0;
+double last_odom_pub_walltime_ = -1.0;
 
 void SigHandle(int sig) {
     flg_exit = true;
@@ -145,7 +158,7 @@ void publish_init_map(const ros::Publisher &pubLaserCloudFullRes) {
     pcl::toROSMsg(*init_feats_world, laserCloudmsg);
 
     laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
-    laserCloudmsg.header.frame_id = odom_frame;
+    laserCloudmsg.header.frame_id = map_frame;
     pubLaserCloudFullRes.publish(laserCloudmsg);
 }
 
@@ -169,7 +182,7 @@ void publish_frame_world(const ros::Publisher &pubLaserCloudFullRes) {
         pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
 
         laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
-        laserCloudmsg.header.frame_id = odom_frame;
+        laserCloudmsg.header.frame_id = map_frame;
         pubLaserCloudFullRes.publish(laserCloudmsg);
         // publish_count -= PUBFRAME_PERIOD;
     }
@@ -220,24 +233,67 @@ void publish_frame_body(const ros::Publisher &pubLaserCloudFull_body) {
     // publish_count -= PUBFRAME_PERIOD;
 }
 
-// Orientation of the estimated IMU/body frame in the odom frame.
+// Orientation of the estimated IMU/body frame in the filter's world frame (map_frame).
 inline Eigen::Quaterniond body_quat() {
     return (!use_imu_as_input) ? Eigen::Quaterniond(kf_output.x_.rot) : Eigen::Quaterniond(kf_input.x_.rot);
 }
 
-// Position of the estimated IMU/body frame in the odom frame.
+// Position of the estimated IMU/body frame in the filter's world frame (map_frame).
 inline V3D body_pos() { return (!use_imu_as_input) ? V3D(kf_output.x_.pos) : V3D(kf_input.x_.pos); }
 
-// Pose of base_link in the odom frame. The filter estimates the IMU/body frame, so the
-// fixed body->base_link extrinsic is applied here:
-//   q_base = q_body * R_body_base
-//   p_base = p_body + q_body * t_body_base
-// With the defaults (identity/zero) this reduces to the original body pose.
+// Pose of the odom frame in the map frame -- i.e. where base_link was when the filter
+// initialised. Latched on the first publish and re-latched after a bag-loop reset.
+//
+// The filter's world frame (map_frame) is gravity-levelled, but nothing constrains its yaw:
+// Set_init only rotates measured gravity onto [0,0,-g], so map_frame inherits whatever the
+// IMU happened to be pointing at. With this mount that yaw is not even repeatable -- the
+// IMU is inverted (extrinsic_R_base maps base +z to body -z), which makes the two gravity
+// vectors antiparallel, and Set_init's rotation axis (g_world x g_body) is then pinned by
+// nothing but the residual tilt and noise at startup. Applying extrinsic_R_base to the
+// child side alone leaves the trajectory in that frame, so base_link's axes come out
+// rotated by an arbitrary angle: lateral motion reads out along x, a diagonal, or anything
+// else, differently on each run.
+//
+// Re-expressing the pose relative to the initial base_link pose cancels both that arbitrary
+// yaw and the extrinsic's own, and gives the REP-105 odom frame the ZED also uses: origin
+// at the start point, axes along base_link, so the two odometries are directly comparable.
+bool odom_origin_latched = false;
+Eigen::Quaterniond q_map_odom = Eigen::Quaterniond::Identity(); // R_map_odom
+V3D p_map_odom = V3D::Zero();                                   // t_map_odom
+
+// Both frames sharing a name is the legacy single-frame setup: leave the origin at identity
+// so the published pose stays in the filter's world frame exactly as before.
+inline bool rebase_to_odom_frame() { return odom_frame != map_frame; }
+
+void publish_odom_to_map_tf();
+
+void latch_odom_origin() {
+    if (odom_origin_latched || !rebase_to_odom_frame()) {
+        return;
+    }
+    const Eigen::Quaterniond q_body = body_quat();
+    q_map_odom = q_body * Eigen::Quaterniond(Base_R_wrt_IMU);
+    q_map_odom.normalize();
+    p_map_odom = body_pos() + q_body * Base_T_wrt_IMU;
+    odom_origin_latched = true;
+    publish_odom_to_map_tf();
+}
+
+// Pose of base_link in the odom frame. The filter estimates the IMU/body frame in map_frame,
+// so the fixed body->base_link extrinsic is applied first:
+//   q_map_base = q_body * R_body_base
+//   p_map_base = p_body + q_body * t_body_base
+// and the result is then re-expressed in the odom frame latched above. With the defaults
+// (identity/zero extrinsic, odom_frame == map_frame) this reduces to the original body pose.
 template <typename T> void set_posestamp(T &out) {
     const Eigen::Quaterniond q_body = body_quat();
 
-    const V3D p_base = body_pos() + q_body * Base_T_wrt_IMU;
-    Eigen::Quaterniond q_base = q_body * Eigen::Quaterniond(Base_R_wrt_IMU);
+    const V3D p_map_base = body_pos() + q_body * Base_T_wrt_IMU;
+    const Eigen::Quaterniond q_map_base = q_body * Eigen::Quaterniond(Base_R_wrt_IMU);
+
+    const Eigen::Quaterniond q_odom_map = q_map_odom.conjugate();
+    const V3D p_base = q_odom_map * (p_map_base - p_map_odom);
+    Eigen::Quaterniond q_base = q_odom_map * q_map_base;
     q_base.normalize();
 
     out.position.x = p_base(0);
@@ -249,12 +305,91 @@ template <typename T> void set_posestamp(T &out) {
     out.orientation.w = q_base.w();
 }
 
-void publish_odometry(const ros::Publisher &pubOdomAftMapped) {
+// The 6x6 covariance of the pose set_posestamp() just wrote, in ROS order
+// [x, y, z, rot_x, rot_y, rot_z], row-major.
+//
+// The filter's error state is p_map_body = p + dp (additive, map frame) and
+// R_map_body = R * Exp(dtheta) -- a right/body perturbation, since MTK's SO3 boxplus is
+// *this = *this * exp(vec). Pushing both through the same transform set_posestamp applies:
+//
+//   dp_base    = R_om * dp - R_ob * [t_bb]x * dtheta      (t_bb = Base_T_wrt_IMU)
+//   dtheta_odom = R_ob * dtheta                            (R_ob = R_om * R_map_body)
+//
+// so J is block upper-triangular and C = J P J'. The rotation block comes out about
+// odom_frame's axes, not base_link's: converting the body-frame perturbation to a
+// fixed-frame one cancels Base_R_wrt_IMU exactly, which is why the base extrinsic shows up
+// only in the lever-arm term above. That is the convention robot_localization assumes when
+// it rotates a pose covariance into its own target frame, and it is why the rviz display
+// for this topic wants Covariance/Orientation/Frame: Fixed rather than Local.
+//
+// Caveat worth knowing: P is the filter's *absolute* uncertainty in map_frame, while the
+// pose is relative to the odom origin latched from that same state. Strictly the origin's
+// own uncertainty and its correlation with the current state should be subtracted; the
+// filter does not keep that cross-covariance, so it cannot be. The result over-estimates
+// near t=0 -- the pose is exactly the origin, yet C starts at reset_cov_output's 0.01*I --
+// which is the safe direction for a downstream EKF, and washes out as the run proceeds.
+//
+// Templated on the array type for the same reason set_posestamp is templated on the pose
+// type: it avoids naming boost::array<double, 36> here.
+template <typename T> void set_pose_covariance(T &cov) {
+    // kf_input.P_ is 24x24 and kf_output.P_ is 30x30 (esekfom's cov is Matrix<n, n> with
+    // n = state::DOF), so the two blocks are unrelated types -- a ternary like the one in
+    // body_quat() does not compile here. Assign into a fixed 6x6 instead. pos occupies
+    // error-state indices 0-2 and rot 3-5 in both manifolds, which is already ROS order.
+    Eigen::Matrix<double, 6, 6> P6;
+    if (!use_imu_as_input) {
+        P6 = kf_output.P_.block<6, 6>(0, 0);
+    } else {
+        P6 = kf_input.P_.block<6, 6>(0, 0);
+    }
+
+    const M3D R_om = q_map_odom.conjugate().toRotationMatrix();
+    const M3D R_ob = R_om * body_quat().toRotationMatrix();
+
+    Eigen::Matrix<double, 6, 6> J = Eigen::Matrix<double, 6, 6>::Zero();
+    J.block<3, 3>(0, 0) = R_om;
+    J.block<3, 3>(0, 3) = -R_ob * skew_sym_mat(Base_T_wrt_IMU);
+    J.block<3, 3>(3, 3) = R_ob;
+
+    Eigen::Matrix<double, 6, 6> C = J * P6 * J.transpose();
+    // The filter's update is not in Joseph form, so P_ drifts slightly asymmetric.
+    // Symmetrise before publishing; consumers assume it. eval() breaks the aliasing.
+    C = 0.5 * (C + C.transpose().eval());
+
+    C *= pose_cov_scale;
+    for (int i = 0; i < 6; ++i) {
+        C(i, i) = std::max(C(i, i), pose_cov_min[i]);
+    }
+    for (int i = 0; i < 36; ++i) {
+        cov[i] = C(i / 6, i % 6);
+    }
+}
+
+void publish_odometry(const ros::Publisher &pubOdomAftMapped, const ros::Publisher &pubLioPose,
+                      const ros::Publisher &pubLioPoseCov) {
+    latch_odom_origin();
     odomAftMapped.header.frame_id = odom_frame;
     odomAftMapped.child_frame_id = base_frame;
     const double stamp = publish_odometry_without_downsample ? time_current : lidar_end_time;
 
-    if (odom_pub_freq > 0.0) {
+    // time_current is still 0 until the estimator has walked its first point, and the
+    // end-of-scan safety-net call can reach here before that has happened on a first scan
+    // that carries no usable points. Publishing that would put an epoch-0 stamp on the
+    // odometry and the TF, and ros::Time::fromSec throws outright on a negative one.
+    if (stamp <= 0.0) {
+        return;
+    }
+
+    // Re-publishing an estimator instant already sent says nothing new. This only comes up
+    // because of the end-of-scan safety-net call in the main loop, which re-enters with an
+    // unchanged time_current whenever the point-by-point path already published; dropping
+    // the duplicate here is what makes that safety net a no-op in the healthy case.
+    if (stamp == last_published_odom_stamp_) {
+        return;
+    }
+
+    // readParameters guarantees odom_pub_freq > 0 whenever the gate is enabled.
+    if (odom_pub_freq_en) {
         static double last_odom_pub_stamp = -1.0;
         const double min_interval = 1.0 / odom_pub_freq;
         // stamp < last => time ran backwards (bag loop / flg_reset): publish and re-latch
@@ -263,6 +398,9 @@ void publish_odometry(const ros::Publisher &pubOdomAftMapped) {
         }
         last_odom_pub_stamp = stamp;
     }
+
+    last_published_odom_stamp_ = stamp;
+    last_odom_pub_walltime_ = ros::WallTime::now().toSec();
 
     odomAftMapped.header.stamp = ros::Time().fromSec(stamp);
     set_posestamp(odomAftMapped.pose.pose);
@@ -288,6 +426,27 @@ void publish_odometry(const ros::Publisher &pubOdomAftMapped) {
 
     pubOdomAftMapped.publish(odomAftMapped);
 
+    // The same pose again as a bare PoseStamped. Built from odomAftMapped rather than by
+    // calling set_posestamp a second time, so the two topics cannot drift apart: identical
+    // stamp, identical frame, identical numbers, and it inherits the odom_pub_freq_en gate
+    // above. This is the shape the ZED publishes its estimate in
+    // (/zed2i/zed_node/pose), so the two are directly comparable for anything that wants a
+    // pose without the twist and covariance riding along.
+    lio_pose.header = odomAftMapped.header;
+    lio_pose.pose = odomAftMapped.pose.pose;
+    pubLioPose.publish(lio_pose);
+
+    // And once more with the filter's uncertainty attached -- the shape
+    // /zed2i/zed_node/pose_with_covariance comes in, and what robot_localization or a
+    // vision-pose bridge needs in order to weight this estimate against another. Same
+    // source pose, so it inherits the stamp, the frame and the gate above unchanged;
+    // /aft_mapped_to_init deliberately keeps its all-zero covariance so nothing already
+    // recorded changes shape.
+    lio_pose_cov.header = odomAftMapped.header;
+    lio_pose_cov.pose.pose = odomAftMapped.pose.pose;
+    set_pose_covariance(lio_pose_cov.pose.covariance);
+    pubLioPoseCov.publish(lio_pose_cov);
+
     static tf::TransformBroadcaster br;
     tf::Transform transform;
     tf::Quaternion q;
@@ -301,6 +460,15 @@ void publish_odometry(const ros::Publisher &pubOdomAftMapped) {
     br.sendTransform(tf::StampedTransform(transform, odomAftMapped.header.stamp, odom_frame, base_frame));
 }
 
+// One broadcaster for every static transform this node emits. tf2 replaces by
+// child_frame_id, so re-sending odom->map after a reset overwrites the stale one, and a
+// late subscriber still gets base_link->body from the same latched message.
+tf2_ros::StaticTransformBroadcaster &static_tf_broadcaster() {
+    // Function-local so construction happens after ros::init, not at static-init time.
+    static tf2_ros::StaticTransformBroadcaster br;
+    return br;
+}
+
 // Declares base_link -> IMU/body on /tf_static, so the flip is described once and both the
 // odometry math and the TF tree read it from the same yaml keys. Called once at startup.
 void publish_static_tf() {
@@ -308,7 +476,7 @@ void publish_static_tf() {
     if (base_frame == imu_frame) {
         return;
     }
-    static tf2_ros::StaticTransformBroadcaster static_br;
+    tf2_ros::StaticTransformBroadcaster &static_br = static_tf_broadcaster();
 
     // The config stores body->base_link; TF needs base_link->body, so invert it.
     const M3D R_base_imu = Base_R_wrt_IMU.transpose();
@@ -330,7 +498,32 @@ void publish_static_tf() {
     static_br.sendTransform(tf_msg);
 }
 
+// Hangs the filter's world frame off the odom frame, so /cloud_registered and the odometry
+// stay in one tree. Cannot go out at startup like the transform above: the origin is only
+// known once the filter has a pose, so latch_odom_origin() calls this instead.
+void publish_odom_to_map_tf() {
+    tf2_ros::StaticTransformBroadcaster &static_br = static_tf_broadcaster();
+
+    // q_map_odom / p_map_odom describe odom in map; TF wants odom -> map, so invert.
+    const Eigen::Quaterniond q_odom_map = q_map_odom.conjugate();
+    const V3D t_odom_map = q_odom_map * -p_map_odom;
+
+    geometry_msgs::TransformStamped tf_msg;
+    tf_msg.header.stamp = ros::Time::now();
+    tf_msg.header.frame_id = odom_frame;
+    tf_msg.child_frame_id = map_frame;
+    tf_msg.transform.translation.x = t_odom_map(0);
+    tf_msg.transform.translation.y = t_odom_map(1);
+    tf_msg.transform.translation.z = t_odom_map(2);
+    tf_msg.transform.rotation.x = q_odom_map.x();
+    tf_msg.transform.rotation.y = q_odom_map.y();
+    tf_msg.transform.rotation.z = q_odom_map.z();
+    tf_msg.transform.rotation.w = q_odom_map.w();
+    static_br.sendTransform(tf_msg);
+}
+
 void publish_path(const ros::Publisher pubPath) {
+    latch_odom_origin();
     set_posestamp(msg_body_pose.pose);
     // msg_body_pose.header.stamp = ros::Time::now();
     msg_body_pose.header.stamp = ros::Time().fromSec(lidar_end_time);
@@ -340,15 +533,90 @@ void publish_path(const ros::Publisher pubPath) {
     // if (jjj % 2 == 0) // if path is too large, the rvis will crash
     {
         path.poses.emplace_back(msg_body_pose);
+        // nav_msgs/Path is cumulative and the whole thing is re-serialised and re-sent on
+        // every scan, so an uncapped path makes this publish cost grow linearly with uptime:
+        // by the end of an hour at 10 Hz it is ~36k poses going out ten times a second. That
+        // is a steady squeeze on a node that has to keep up with the sensors in real time,
+        // and it is one more thing that only bites "after running a while". Drop the oldest.
+        if (path_max_poses > 0 && static_cast<int>(path.poses.size()) > path_max_poses) {
+            const size_t excess = path.poses.size() - static_cast<size_t>(path_max_poses);
+            path.poses.erase(path.poses.begin(), path.poses.begin() + excess);
+        }
         pubPath.publish(path);
     }
+}
+
+// Watchdog for this node's characteristic failure: it stops publishing but stays alive, so
+// nothing crashes, roslaunch never notices, and nothing is logged. Driven from the main loop
+// on wall time and deliberately outside the sync_packages() gate -- the most opaque stall is
+// sync_packages itself returning false for ever, and in that state nothing inside the gate
+// runs at all.
+//
+// The dump is meant to name the stuck stage rather than just report silence:
+//   lidar/imu age   seconds since the subscriber last received a message. Climbing means the
+//                   sensor or driver stopped. Flat near zero means data is still arriving.
+//   dropped         messages the monotonicity guards in the callbacks threw away. Climbing
+//                   with a flat age is the latched-future-timestamp wedge: the driver is
+//                   publishing, this node is refusing everything.
+//   buffered        scans and IMU samples waiting for sync_packages. Both growing without
+//                   bound while data arrives and nothing is dropped means sync_packages is
+//                   blocked -- read the next line for why.
+//   need imu to     sync_packages holds a scan until the IMU stream reaches its end time.
+//                   A large positive value here is that wait; a huge one means lidar_end_time
+//                   was poisoned by an outlier point offset and will never be reached.
+//   state finite    false means the filter diverged to NaN. That is terminal: every later
+//                   LiDAR update finds no match, so the state can never be corrected back.
+void check_odom_stall() {
+    if (odom_stall_warn_sec <= 0.0 || last_odom_pub_walltime_ < 0.0) {
+        return; // disabled, or nothing published yet -- still initialising
+    }
+    const double now = ros::WallTime::now().toSec();
+    const double silent_for = now - last_odom_pub_walltime_;
+    if (silent_for < odom_stall_warn_sec) {
+        return;
+    }
+
+    static double last_report = -1.0;
+    if (last_report > 0.0 && now - last_report < odom_stall_warn_sec) {
+        return;
+    }
+    last_report = now;
+
+    const V3D p = body_pos();
+    const Eigen::Quaterniond q = body_quat();
+    const bool finite = p.allFinite() && std::isfinite(q.w()) && std::isfinite(q.x()) && std::isfinite(q.y()) &&
+                        std::isfinite(q.z());
+
+    ROS_ERROR("Point-LIO STALL: no odometry for %.2f s | lidar age %.2f s (%lu dropped), "
+              "imu age %.2f s (%lu dropped) | buffered %zu scans / %zu imu | "
+              "lidar_pushed=%d lose_lid=%d need imu to reach %+.3f s past last | "
+              "time_current=%.3f state_finite=%d",
+              silent_for, last_lidar_cbk_walltime < 0.0 ? -1.0 : now - last_lidar_cbk_walltime,
+              static_cast<unsigned long>(lidar_loopback_drops),
+              last_imu_cbk_walltime < 0.0 ? -1.0 : now - last_imu_cbk_walltime,
+              static_cast<unsigned long>(imu_loopback_drops), lidar_buffer.size(), imu_deque.size(),
+              static_cast<int>(lidar_pushed), static_cast<int>(lose_lid), lidar_end_time - last_timestamp_imu,
+              time_current, static_cast<int>(finite));
 }
 
 int main(int argc, char **argv) {
     ros::init(argc, argv, "laserMapping");
     ros::NodeHandle nh("~");
-    ros::AsyncSpinner spinner(0);
-    spinner.start();
+    // NO background spinner here, deliberately. Upstream ran `ros::AsyncSpinner spinner(0)`
+    // (0 = one thread per core) *and* ros::spinOnce() in the loop below, so the subscriber
+    // callbacks executed on the spinner threads while this thread was inside the estimator.
+    // Both sides touch lidar_buffer / time_buffer / imu_deque with no synchronisation --
+    // mtx_buffer exists but every lock() call site in li_initialization.cpp is commented
+    // out -- so imu_cbk's emplace_back raced pop_front in the point-by-point loop. Racing
+    // push/pop on a std::deque is undefined: the usual outcome is a torn _M_start/_M_finish,
+    // after which the buffer reads back permanently empty, sync_packages returns false for
+    // ever, and the node keeps running happily while the pose stream stops dead with no
+    // error printed. That is the "output stops after a while" failure.
+    //
+    // Spinning only from this thread makes the whole node single-threaded, which removes the
+    // race by construction rather than by locking ~20 imu_deque call sites in the estimator.
+    // Nothing is dropped meanwhile: both subscribers below queue 200000 messages, far more
+    // than the ~20 IMU samples that accumulate during one scan's processing.
     readParameters(nh);
     cout << "lidar_type: " << lidar_type << endl;
     ivox_ = std::make_shared<IVoxType>(ivox_options_);
@@ -411,6 +679,11 @@ int main(int argc, char **argv) {
     // ("/cloud_effected", 1000);
     ros::Publisher pubLaserCloudMap = nh.advertise<sensor_msgs::PointCloud2>("/Laser_map", 1000);
     ros::Publisher pubOdomAftMapped = nh.advertise<nav_msgs::Odometry>("/aft_mapped_to_init", 1000);
+    // base_frame's current pose in odom_frame, published alongside /aft_mapped_to_init.
+    ros::Publisher pubLioPose = nh.advertise<geometry_msgs::PoseStamped>("/lio_pose", 1000);
+    // The same pose with the filter's uncertainty attached, for consumers that weight it.
+    ros::Publisher pubLioPoseCov =
+        nh.advertise<geometry_msgs::PoseWithCovarianceStamped>("/lio_pose_with_covariance", 1000);
     ros::Publisher pubPath = nh.advertise<nav_msgs::Path>("/path", 1000);
     // ros::Publisher plane_pub = nh.advertise<visualization_msgs::Marker>
     // ("/planner_normal", 1000);
@@ -440,6 +713,9 @@ int main(int argc, char **argv) {
                 is_first_frame = true;
                 flg_reset = false;
                 init_map = false;
+                // The state went back to the origin and Set_init will pick a new yaw, so the
+                // latched odom origin no longer describes anything. Re-latch on next publish.
+                odom_origin_latched = false;
 
                 {
                     ivox_.reset(new IVoxType(ivox_options_));
@@ -703,7 +979,7 @@ int main(int argc, char **argv) {
                         if (publish_odometry_without_downsample) {
                             /******* Publish odometry *******/
 
-                            publish_odometry(pubOdomAftMapped);
+                            publish_odometry(pubOdomAftMapped, pubLioPose, pubLioPoseCov);
                             if (runtime_pos_log) {
                                 euler_cur = SO3ToEuler(kf_output.x_.rot);
                                 fout_out << setw(20) << Measures.lidar_beg_time - first_lidar_time << " "
@@ -890,7 +1166,7 @@ int main(int argc, char **argv) {
                         if (publish_odometry_without_downsample) {
                             /******* Publish odometry *******/
 
-                            publish_odometry(pubOdomAftMapped);
+                            publish_odometry(pubOdomAftMapped, pubLioPose, pubLioPoseCov);
                             if (runtime_pos_log) {
                                 euler_cur = SO3ToEuler(kf_input.x_.rot);
                                 fout_out << setw(20) << Measures.lidar_beg_time - first_lidar_time << " "
@@ -987,9 +1263,20 @@ int main(int argc, char **argv) {
             // geoQuat = tf::createQuaternionMsgFromRollPitchYaw
             //                     (euler_cur(0), euler_cur(1), euler_cur(2));
             /******* Publish odometry downsample *******/
-            if (!publish_odometry_without_downsample) {
-                publish_odometry(pubOdomAftMapped);
-            }
+            // Unconditional, once per scan. When publish_odometry_without_downsample is set,
+            // the per-point publishes inside the estimator above sit *after* the
+            // `if (!kf.update_iterated_dyn_share_modified()) continue;` guard, so odometry
+            // only goes out on point batches whose LiDAR update succeeded. h_model_output
+            // fails a batch whenever it finds no plane match (effect_num_k == 0), and a
+            // filter that has lost the map fails every batch of every future scan -- there is
+            // no path back, because only a successful update could correct the state. The
+            // stream then stops permanently while the node stays healthy.
+            //
+            // This call is the floor: while scans keep arriving, pose keeps going out at
+            // least at scan rate, IMU-propagated if LiDAR cannot correct it. In the healthy
+            // case it costs nothing -- the point-by-point path already published this
+            // time_current, so publish_odometry drops it as a duplicate instant.
+            publish_odometry(pubOdomAftMapped, pubLioPose, pubLioPoseCov);
 
             /*** add the feature points to map ***/
             t3 = omp_get_wtime();
@@ -1047,6 +1334,9 @@ int main(int argc, char **argv) {
                 dump_lio_state_to_log(fp);
             }
         }
+        // Outside the sync_packages() branch on purpose: a stalled sync_packages is exactly
+        // the case this has to be able to report on.
+        check_odom_stall();
         status = ros::ok();
         loop_rate.sleep();
     }

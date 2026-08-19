@@ -19,6 +19,9 @@ extern std::deque<PointCloudXYZI::Ptr> lidar_buffer;
 extern std::deque<double> time_buffer;
 extern std::deque<sensor_msgs::Imu::Ptr> imu_deque;
 extern std::mutex m_time;
+// Liveness counters for the stall watchdog; see the definitions in li_initialization.cpp.
+extern double last_lidar_cbk_walltime, last_imu_cbk_walltime;
+extern uint64_t lidar_loopback_drops, imu_loopback_drops;
 extern bool lidar_pushed, imu_pushed;
 extern double imu_first_time;
 extern bool lose_lid;

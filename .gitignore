@@ -1,0 +1,5 @@
+# pcd_save_en writes here (config/*.yaml keep it false by default)
+PCD/
+
+# run_with_log.sh tees node output here
+Log/*.log
