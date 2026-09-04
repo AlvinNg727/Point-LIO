@@ -13,21 +13,6 @@
         name="laserMapping" output="screen"
         launch-prefix="$(find point_lio)/scripts/run_with_log.sh $(arg log_dir)/laserMapping.log">
         <rosparam command="load" file="$(find point_lio)/config/mid360s.yaml" />
-        <param name="use_imu_as_input" type="bool" value="0" /> <!--change
-        to 1 to use IMU as input of Point-LIO-->
-        <param name="prop_at_freq_of_imu" type="bool" value="1" />
-        <param name="check_satu" type="bool" value="1" />
-        <param name="init_map_size" type="int" value="10" />
-        <param name="point_filter_num" type="int" value="1" /> <!--4,
-        3-->
-        <param name="space_down_sample" type="bool" value="1" />
-        <param name="filter_size_surf" type="double" value="0.5" /> <!--0.5,
-        0.3, 0.2, 0.15, 0.1-->
-        <param name="filter_size_map" type="double" value="0.4" /> <!--0.5,
-        0.3, 0.15, 0.1-->
-        <param name="ivox_nearby_type" type="int" value="6" /> <!--0.5,
-        0.3, 0.15, 0.1-->
-        <param name="runtime_pos_log_enable" type="bool" value="0" /> <!--1-->
         <!-- publish the LIO pose where downstream nodes expect the ZED pose -->
         <remap from="/lio_pose" to="/zed2i/zed_node/pose" />
         <remap from="/lio_pose_with_covariance" to="/zed2i/zed_node/pose_with_covariance" />

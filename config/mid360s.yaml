@@ -1,3 +1,25 @@
+# false: IMU as a measurement -- the Point-LIO output model, 30 states, angular velocity
+# and acceleration estimated explicitly, saturation handling active. This is what makes
+# Point-LIO robust to aggressive motion, and it is what the mapping/*_cov_output noise
+# values below are for. true: the FAST-LIO-style input model, 24 states, IMU integrated
+# as a control input (then mapping/gyr_cov_input, acc_cov_input apply instead).
+use_imu_as_input: false
+# true: propagate covariance only at IMU timestamps. false adds a second propagation at
+# every point's timestamp -- more accurate, much more expensive at the 1.5 kHz point rate.
+prop_at_freq_of_imu: true
+check_satu: true # reject IMU samples clipping mapping/satu_acc and mapping/satu_gyro
+init_map_size: 10 # points accumulated before the initial iVox map is built
+point_filter_num: 6 # keep 1 point in every N as read from the driver # 4, 3
+space_down_sample: true # voxel-grid downsample each scan, leaf size filter_size_surf
+filter_size_surf: 0.5 # leaf size for the current scan # 0.5, 0.3, 0.2, 0.15, 0.1
+filter_size_map: 0.4 # leaf size deciding if a new point is redundant with the map # 0.5, 0.3, 0.15, 0.1
+# iVox neighbour stencil: 0 = own voxel, 6 = faces, 18 = + edges, 26 = full 3x3x3. Any
+# other value silently falls back to 18. Pairs with mapping/ivox_grid_resolution.
+ivox_nearby_type: 6
+# Write per-update state dumps to Log/mat_out.txt, imu_pbp.txt, pos_log.txt. Off by
+# default: it is file I/O in the hot loop.
+runtime_pos_log_enable: false
+
 common:
   lid_topic: "/livox/lidar"
   imu_topic: "/livox/imu"
