@@ -3,6 +3,16 @@
 
     <arg name="rviz" default="true" />
     <arg name="log_dir" default="$(find point_lio)/Log" />
+    <!-- Publish /cloud_registered and /path. Nothing on the vehicle subscribes to either
+         (downstream consumes the pose, via the ZED remaps below); they exist for rviz and
+         for the opt-in cloud/path recording in record_topics.sh. publish_frame_world()
+         copies the whole downsampled scan into a fresh cloud plus pcl::toROSMsg every
+         frame, and publish_path() re-serialises the entire accumulated path (up to
+         path_max_poses) every frame: pure waste with no subscriber. Default true so
+         standalone and playback runs still visualise; full.launch sets it false for
+         flight. Kept separate from `rviz`: playback.sh passes rviz:=false and runs its
+         own rviz against playback.rviz, so it still needs these topics published. -->
+    <arg name="viz_topics" default="true" />
 
     <!--
 		to profile, add launch-prefix="valgrind" to the node tag below
@@ -13,6 +23,9 @@
         name="laserMapping" output="screen"
         launch-prefix="$(find point_lio)/scripts/run_with_log.sh $(arg log_dir)/laserMapping.log">
         <rosparam command="load" file="$(find point_lio)/config/mid360s.yaml" />
+        <!-- Applied after the rosparam load, so these override the yaml's true. -->
+        <param name="publish/scan_publish_en" type="bool" value="$(arg viz_topics)" />
+        <param name="publish/path_en"         type="bool" value="$(arg viz_topics)" />
         <!-- publish the LIO pose where downstream nodes expect the ZED pose -->
         <remap from="/lio_pose" to="/zed2i/zed_node/pose" />
         <remap from="/lio_pose_with_covariance" to="/zed2i/zed_node/pose_with_covariance" />

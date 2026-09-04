@@ -1,0 +1,52 @@
+<launch>
+    <!--
+        Offline counterpart to full.launch: Point-LIO fed from a bag instead of the live
+        Livox driver, with rviz.
+
+            roslaunch point_lio bag.launch bag:=/catkin_ws/src/Point-LIO/recordings/foo.bag
+            roslaunch point_lio bag.launch bag:=foo.bag rate:=0.5 start:=40
+
+        The bag must carry Point-LIO's raw inputs (/livox/lidar as
+        livox_ros_driver2/CustomMsg, plus /livox/imu); record it with
+        "./record_topics.sh raw-lidar". A bag holding only the pose topics has nothing for
+        the estimator to consume.
+
+        rviz and the node stay up when the bag ends, so the final map can be inspected;
+        Ctrl-C closes the session.
+    -->
+    <arg name="bag" />
+    <arg name="rviz" default="true" />
+    <arg name="log_dir" default="$(find point_lio)/Log" />
+    <!-- Passthrough to mapping_mid360s.launch. Set viz_topics:=false to replay a bag with
+         the estimator's /cloud_registered and /path publishing suppressed, matching what
+         full.launch does in flight, so an offline CPU measurement is apples-to-apples. -->
+    <arg name="viz_topics" default="true" />
+
+    <!-- The bag's clock is the only time source here, so everything downstream has to read
+         it. roslaunch sets params before it starts any node, so this lands in time. -->
+    <param name="use_sim_time" value="true" />
+
+    <arg name="rate" default="1.0" />
+    <arg name="start" default="0.0" />
+    <!-- laserMapping subscribes on startup and rviz builds its displays; without a delay
+         the first seconds of the bag play to nobody. -->
+    <arg name="delay" default="3.0" />
+    <!-- Anything else for rosbag play, e.g. loop, duration=SEC, pause (each with its own
+         leading dashes). -->
+    <arg name="play_args" default="" />
+    <!-- A whitelist, because laserMapping consumes exactly these two. It is also what
+         keeps a bag's recorded /tf and /aft_mapped_to_init out of the session, where they
+         would fight the live node for the same names and frames. Add topics here only if
+         you want them replayed alongside the fresh run. -->
+    <arg name="topics" default="/livox/lidar /livox/imu" />
+
+    <include file="$(find point_lio)/launch/mapping_mid360s.launch">
+        <arg name="rviz" value="$(arg rviz)" />
+        <arg name="viz_topics" value="$(arg viz_topics)" />
+        <arg name="log_dir" value="$(arg log_dir)" />
+    </include>
+
+    <!-- The topics flag swallows every argument after it, so the bag path goes first. -->
+    <node pkg="rosbag" type="play" name="rosbag_play" output="screen"
+        args="--clock --rate=$(arg rate) --start=$(arg start) --delay=$(arg delay) $(arg play_args) $(arg bag) --topics $(arg topics)" />
+</launch>

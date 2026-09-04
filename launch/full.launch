@@ -4,6 +4,9 @@
     <include file="$(find livox_ros_driver2)/launch_ROS1/msg_MID360s.launch" />
     <include file="$(find point_lio)/launch/mapping_mid360s.launch">
         <arg name="rviz" value="false" />
+        <!-- No rviz and no other subscriber in flight: skip the per-frame cloud copy and
+             the per-frame full-path re-serialisation. -->
+        <arg name="viz_topics" value="false" />
         <arg name="log_dir" value="$(arg log_dir)" />
     </include>
 </launch>
