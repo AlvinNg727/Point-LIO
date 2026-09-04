@@ -67,7 +67,7 @@ Visualization Manager:
       Length: 0.699999988079071
       Name: Axes
       Radius: 0.05999999865889549
-      Reference Frame: base_link
+      Reference Frame: lio_base_link
       Value: true
     - Class: rviz/Group
       Displays:
@@ -110,6 +110,13 @@ Visualization Manager:
           Class: rviz/PointCloud2
           Color: 255; 255; 255
           Color Transformer: Intensity
+          # Deliberately long: this display IS the accumulated map, so it keeps every scan
+          # of a ~17 min run on screen. rviz holds each incoming cloud as its own scene
+          # object rather than merging them, so cost grows with (decay x scan rate) -- at
+          # 10 Hz this is up to 10000 objects. That is affordable on the GPU and NOT
+          # affordable on llvmpipe, which is what the container fell back to before the
+          # GLX fix in ../../compose.yaml. If the frame rate ever sags on a very long run,
+          # this is the first number to trade down.
           Decay Time: 1000
           Enabled: true
           Invert Rainbow: true
@@ -117,8 +124,13 @@ Visualization Manager:
           Min Color: 0; 0; 0
           Name: currPoints
           Position Transformer: XYZ
+          # Left deep on purpose, to match Decay Time: a shallow queue would let rviz drop
+          # scans when it falls behind, and a dropped scan is a permanent hole in the map.
           Queue Size: 100000
-          Selectable: true
+          # Picking builds a second render pass and keeps a CPU-side copy of every point --
+          # on a map this size that is the one cost here that buys nothing visible. Set
+          # back to true if you need to click individual points to read their coordinates.
+          Selectable: false
           Size (Pixels): 1
           Size (m): 0.009999999776482582
           Style: Points
@@ -202,7 +214,13 @@ Visualization Manager:
       Radius: 0.10000000149011612
       Reference Frame: <Fixed Frame>
       Value: true
-    - Alpha: 0
+    # /path is cumulative and re-sent in full on every scan (up to publish/path_max_poses,
+    # 20000 in config/mid360s.yaml), so whatever this display costs, it pays it 10x a
+    # second. Billboards rebuilds four CPU-side vertices per segment each message; Lines
+    # submits the vertices as-is and costs almost nothing. Alpha was 0, which drew nothing
+    # while still paying the full rebuild -- set to 1 so the trail is actually visible.
+    # Set Enabled: false if you would rather not see it at all.
+    - Alpha: 1
       Buffer Length: 2
       Class: rviz/Path
       Color: 25; 255; 255
@@ -210,7 +228,7 @@ Visualization Manager:
       Head Diameter: 0
       Head Length: 0
       Length: 0.30000001192092896
-      Line Style: Billboards
+      Line Style: Lines
       Line Width: 0.20000000298023224
       Name: Path
       Offset:
@@ -296,7 +314,10 @@ Visualization Manager:
     Background Color: 0; 0; 0
     Default Light: true
     Fixed Frame: camera_init
-    Frame Rate: 10
+    # rviz's render-loop ceiling, not a measurement -- it will never draw faster than this
+    # whatever the scene costs. Raising it only pays off with real GPU rendering; see the
+    # __GLX_VENDOR_LIBRARY_NAME note in ../../compose.yaml.
+    Frame Rate: 30
   Name: root
   Tools:
     - Class: rviz/Interact
@@ -335,7 +356,7 @@ Visualization Manager:
       Name: Current View
       Near Clip Distance: 0.009999999776482582
       Pitch: 0.7853981852531433
-      Target Frame: global
+      Target Frame: <Fixed Frame>
       Value: Orbit (rviz)
       Yaw: 0.7853981852531433
     Saved: ~
